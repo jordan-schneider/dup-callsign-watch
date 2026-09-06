@@ -36,7 +36,27 @@ Set `ALERT_WEBHOOK` to a Slack/Discord/ntfy URL to get pushed alerts.
 - BTS data lags ~3 months. Carrier codes: OH=PSA, MQ=Envoy, YX=Republic, PT=Piedmont.
 - BTS keeps the departure date for overnight flights; `exposure.py` handles the midnight wrap.
 - Blank tail numbers in BTS are treated as "different aircraft." Check `exposure_events.csv` for 2026-04-22 JIA5383 at SDF as a known-positive.
-- Tested on synthetic data reproducing the PHX timing; not yet validated against a full BTS month or live feeds.
+- `exposure.py` scores on *airborne* overlap (outbound wheels-off to inbound wheels-on, via `TaxiOut`/`TaxiIn`), since BTS `DepTime`/`ArrTime` are gate times and a gate overlap shorter than the combined taxi never put two aircraft up together. `overlap_gate_min` keeps the looser gate reading.
+
+### What the exposure numbers mean
+
+BTS records the operating **flight number**, not the **ATC callsign** that was filed.
+When dispatch sees a pending duplicate it normally *stubs* one leg — files a distinct
+callsign — so controllers never hear two identical ones. `exposure.py` therefore counts
+the *opportunity* for a duplicate callsign; the publicised events are the subset where
+stubbing did not happen. Do not call a row a confirmed duplicate-callsign event without
+independent evidence (ATC audio, or ADS-B showing both aircraft broadcasting the same
+ident). `watch.py live` reads broadcast callsigns and has no such limitation.
+
+Backtest over 2025-09..2026-06 for AA/OH/MQ/YX/PT: 1,529,610 flights, 307,544
+out-and-back pair-days, **416** with an airborne overlap and different tails (729 on the
+looser gate test). Median overlap 36 min; 134 of the 416 overlap by <=20 min, meaning both
+aircraft were still inside the turn airport's terminal area — the geometry of the PHX and
+PVD events. Both known-positives inside BTS coverage are detected: JIA5383/SDF 2026-04-22
+(11 min airborne) and AAL1275/LAS 2026-04-25 (4 min).
+
+For calibration, the reported AA5083/PVD event on 2026-08-12 was ~26 minutes of shared
+airborne time, which sits in the modal bucket of this distribution rather than at its tail.
 
 ## Where to report a finding
 

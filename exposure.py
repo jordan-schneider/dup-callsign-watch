@@ -6,8 +6,19 @@ Finds flight numbers used on both legs of an out-and-back (A->B then B->A,
 same carrier, same day) and, for each day, checks whether the inbound leg's
 *actual* arrival was later than the outbound leg's *actual* departure. When
 it was, and the two legs used different tail numbers, two aircraft were
-airborne simultaneously under the same callsign. That is exactly the
+airborne simultaneously under the same flight number. That is exactly the
 mechanism behind AA2482 (PHX), AA5083 (PVD), AA5383 (SDF), AA1275 (LAS).
+
+IMPORTANT -- what this does and does not measure. BTS records the operating
+flight number, not the ATC callsign that was actually filed. When dispatch sees
+a pending duplicate it normally "stubs" one leg, filing a distinct callsign so
+controllers never receive two identical ones. This script therefore counts the
+*opportunity* for a duplicate callsign, not confirmed duplicates on frequency.
+The publicised events are the subset where stubbing did not happen. Treat the
+output as an exposure ranking for deconfliction, and do not describe a row as a
+confirmed duplicate-callsign event without independent evidence (ATC audio,
+ADS-B showing both aircraft squawking the same ident). watch.py live has no such
+limitation: it reads broadcast callsigns and so sees genuine duplicates.
 
 Usage:
   1. Download monthly zips from
