@@ -4,3 +4,5 @@ exposure_events.csv
 exposure_pairs.csv
 __pycache__/
 .venv/
+fr24_cache/
+validated_events.csv

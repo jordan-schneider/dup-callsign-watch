@@ -31,6 +31,37 @@ python watch.py predict --pairs exposure_pairs.csv --top 200
 
 Set `ALERT_WEBHOOK` to a Slack/Discord/ntfy URL to get pushed alerts.
 
+## Validating the exposure list against real callsigns
+
+`exposure.py` proves a *flight number* was airborne twice; it cannot tell you whether ATC
+ever heard two identical callsigns, because a stubbed leg looks identical in BTS.
+`validate_callsigns.py` closes that gap using the Flightradar24 API, which returns the
+marketing number and the ATC callsign as separate fields:
+
+```bash
+export FR24_TOKEN=...
+python validate_callsigns.py --estimate            # query plan, no API calls, no cost
+python validate_callsigns.py --limit-events 40     # cheap first pass on the riskiest rows
+python validate_callsigns.py --max-queries 250     # full run: ~213 calls for ~430 events
+```
+
+Each event is classified `duplicate_reached_atc` (both legs broadcast the same callsign),
+`stubbed` (they differ, so the deconfliction worked), or `not_found`. Responses are cached,
+so re-runs cost nothing.
+
+It also recomputes the airborne overlap from FR24's `datetime_takeoff`/`datetime_landed`,
+which are UTC. That is an absolute timeline with no local-midnight anchor and no timezone
+handling, so it independently checks the arithmetic in `exposure.py`.
+
+**Data source note.** Historical broadcast callsigns are the expensive part of this
+problem. OpenSky is free but its REST API only reaches 30 days back, and the full
+historical database is restricted to academic, government and aviation-authority users.
+FlightAware AeroAPI gates historical data behind its Standard tier. ADS-B Exchange sells
+historical backfills to subscription customers only, with annual minimums. The
+Flightradar24 Essential tier ($90/mo, 333k credits, two years of history) is the cheapest
+route to this specific question; it is a recurring subscription, so cancel it when the
+backtest is done.
+
 ## Notes
 
 - BTS data lags ~3 months. Carrier codes: OH=PSA, MQ=Envoy, YX=Republic, PT=Piedmont.
