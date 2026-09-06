@@ -40,7 +40,7 @@ BTS_URL = ("https://transtats.bts.gov/PREZIP/"
 
 COLS = ["FlightDate", "Reporting_Airline", "Tail_Number", "Flight_Number_Reporting_Airline",
         "Origin", "Dest", "CRSDepTime", "DepTime", "CRSArrTime", "ArrTime",
-        "DepDelay", "ArrDelay", "TaxiOut", "TaxiIn", "Cancelled", "Diverted"]
+        "DepDelay", "ArrDelay", "TaxiOut", "TaxiIn", "AirTime", "Cancelled", "Diverted"]
 
 # ICAO carrier prefix so output reads as an ATC callsign
 ICAO = {"AA": "AAL", "OH": "JIA", "MQ": "ENY", "YX": "RPA", "PT": "PDT", "OO": "SKW",
@@ -88,74 +88,123 @@ def hhmm_to_min(s):
 
 
 def build_pairs(df):
-    """Join each flight with the same-carrier, same-number, same-day flight going the reverse direction."""
+    """Join each flight with the same-carrier, same-number, same-day reverse-direction leg.
+
+    All times for a pair are expressed as minutes from the *turn airport's* local midnight
+    on FlightDate. That single anchor is what makes the arithmetic safe, and it is worth
+    being explicit about why: BTS CRSDepTime is local at the origin while CRSArrTime is
+    local at the destination, so differencing them yields the local *clock* change, not
+    elapsed time. JFK-LAX reads 203 minutes against a true block of 383. Any quantity built
+    by subtracting one from the other is wrong by the timezone gap.
+
+    So durations come from AirTime/TaxiOut/TaxiIn, which are true elapsed minutes, and the
+    only cross-leg comparisons are between two times that are both local at the turn
+    airport. Nothing here needs a timezone database, but nothing may difference times
+    measured at different airports either.
+    """
     df = df.copy()
-    for c in ["CRSDepTime", "DepTime", "CRSArrTime", "ArrTime"]:
+    for c in ["CRSDepTime", "CRSArrTime"]:
         df[c + "_m"] = hhmm_to_min(df[c])
-    # BTS keeps FlightDate = scheduled departure date. Only the *schedule* needs a
-    # midnight-wrap guess (a scheduled arrival earlier than its scheduled departure is a
-    # red-eye); schedules carry no delay, so that inference is safe.
-    wrap = df["CRSArrTime_m"] < df["CRSDepTime_m"]
-    df.loc[wrap, "CRSArrTime_m"] += 1440
-    # Actual times are rebuilt from the schedule plus the reported delay rather than read
-    # off the HHMM clock. DepDelay/ArrDelay are signed and unbounded, so this is exact for
-    # any wrap. Inferring the wrap from the clock breaks whenever a delay exceeds 12h: a
-    # leg scheduled 1452 that actually left 0630 the next day (DepDelay=938) reads as 8h
-    # *early*, and the resulting phantom overlap is large enough to top the results.
-    df["DepTime_m"] = df["CRSDepTime_m"] + pd.to_numeric(df["DepDelay"], errors="coerce")
-    df["ArrTime_m"] = df["CRSArrTime_m"] + pd.to_numeric(df["ArrDelay"], errors="coerce")
-    # BTS DepTime/ArrTime are *gate* times. Two aircraft only share a callsign in the air
-    # between the outbound's wheels-off and the inbound's wheels-on.
-    df["WheelsOff_m"] = df["DepTime_m"] + pd.to_numeric(df["TaxiOut"], errors="coerce")
-    df["WheelsOn_m"] = df["ArrTime_m"] - pd.to_numeric(df["TaxiIn"], errors="coerce")
-    df = df[df.DepTime_m.notna() & df.ArrTime_m.notna()
-            & df.WheelsOff_m.notna() & df.WheelsOn_m.notna()]
+    for c in ["DepDelay", "ArrDelay", "TaxiOut", "TaxiIn", "AirTime"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df[df[["CRSDepTime_m", "CRSArrTime_m", "DepDelay", "ArrDelay",
+                "TaxiOut", "TaxiIn", "AirTime"]].notna().all(axis=1)]
     key = ["FlightDate", "Reporting_Airline", "Flight_Number_Reporting_Airline"]
-    a = df.add_suffix("_in")
-    b = df.add_suffix("_out")
-    m = a.merge(b, left_on=[k + "_in" for k in key], right_on=[k + "_out" for k in key])
+    m = df.add_suffix("_in").merge(df.add_suffix("_out"),
+                                   left_on=[k + "_in" for k in key],
+                                   right_on=[k + "_out" for k in key])
     # inbound A->B, outbound B->A, and inbound is scheduled first
     m = m[(m.Origin_in == m.Dest_out) & (m.Dest_in == m.Origin_out)
           & (m.CRSDepTime_m_in < m.CRSDepTime_m_out)].copy()
     m["turn_airport"] = m.Dest_in
+
+    # Scheduled buffer at the turn: the inbound's scheduled arrival and the outbound's
+    # scheduled departure are both local at the turn airport, so this subtraction is one of
+    # the few that is legitimate, and it needs no timezone correction.
+    m["sched_buffer_min"] = m.CRSDepTime_m_out - m.CRSArrTime_m_in
     # A flight number may cover several legs a day (CLT-LEX-CLT-LEX); the self-join then
     # pairs leg 1 with leg 4 as well as with leg 2. Keep the real turn: the reverse-
     # direction leg scheduled to depart soonest after the inbound is scheduled to land.
-    m["_buf"] = m.CRSDepTime_m_out - m.CRSArrTime_m_in
-    m = (m[m._buf >= 0]
-         .sort_values("_buf")
+    m = (m[m.sched_buffer_min >= 0]
+         .sort_values("sched_buffer_min")
          .drop_duplicates(subset=["FlightDate_in", "Reporting_Airline_in",
                                   "Flight_Number_Reporting_Airline_in",
-                                  "Origin_in", "Dest_in", "CRSDepTime_in"])
-         .drop(columns="_buf"))
-    # Scheduled buffer: outbound sched dep minus inbound sched arr. Times are local at turn airport
-    # for both (inbound arrival local, outbound departure local), so no tz correction needed.
-    m["sched_buffer_min"] = m.CRSDepTime_m_out - m.CRSArrTime_m_in
-    # Actual overlap: inbound actual arrival later than outbound actual departure
-    # Both overlaps are interval intersections, not simple differences. Subtracting
-    # (inbound arrival - outbound departure) silently assumes the inbound got airborne
-    # first. When the inbound is delayed *past* the outbound that is false: AAL1218 on
-    # 2025-11-28 was 1191 min late out of DCA and flew 0640-0934 the NEXT day, while the
-    # PHX outbound flew 1401-1937 the day before. The intervals are disjoint, but the
-    # difference reports ~20h of "simultaneous" flight -- longer than either leg was
-    # airborne, and enough to top the results.
-    gate_in = [m.DepTime_m_in, m.ArrTime_m_in]
-    gate_out = [m.DepTime_m_out, m.ArrTime_m_out]
-    m["overlap_gate_min"] = (pd.concat([gate_in[1], gate_out[1]], axis=1).min(axis=1)
-                             - pd.concat([gate_in[0], gate_out[0]], axis=1).max(axis=1))
-    # Airborne overlap: both aircraft actually in the air at once under one callsign. This
-    # is the headline number. A gate overlap shorter than the combined taxi times (median
-    # ~16 min out + ~7 min in) never put two aircraft up together, so scoring on gate times
-    # alone materially overcounts.
-    m["overlap_min"] = (pd.concat([m.WheelsOn_m_in, m.WheelsOn_m_out], axis=1).min(axis=1)
-                        - pd.concat([m.WheelsOff_m_in, m.WheelsOff_m_out], axis=1).max(axis=1))
+                                  "Origin_in", "Dest_in", "CRSDepTime_in"]))
+
+    # --- everything below is minutes from turn-airport local midnight on FlightDate ---
+    # Inbound, worked backwards from its arrival at the turn airport. Actual times come
+    # from schedule + reported delay: BTS delays are signed and unbounded, so this is exact
+    # across any midnight rollover, where reading the HHMM clock is not.
+    m["t_arr_in"] = m.CRSArrTime_m_in + m.ArrDelay_in
+    m["t_won_in"] = m.t_arr_in - m.TaxiIn_in
+    m["t_woff_in"] = m.t_won_in - m.AirTime_in
+    m["t_dep_in"] = m.t_woff_in - m.TaxiOut_in
+    # Outbound, worked forwards from its departure at the turn airport.
+    m["t_dep_out"] = m.CRSDepTime_m_out + m.DepDelay_out
+    m["t_woff_out"] = m.t_dep_out + m.TaxiOut_out
+    m["t_won_out"] = m.t_woff_out + m.AirTime_out
+    m["t_arr_out"] = m.t_won_out + m.TaxiIn_out
+
+    def intersect(start_a, end_a, start_b, end_b):
+        """Length of the overlap of two intervals. A plain difference of one leg's end and
+        the other's start assumes an ordering that a large delay can invert."""
+        return (pd.concat([end_a, end_b], axis=1).min(axis=1)
+                - pd.concat([start_a, start_b], axis=1).max(axis=1))
+
+    # Airborne overlap is the headline: both aircraft actually in the air at once. BTS
+    # DepTime/ArrTime are gate times, so a gate overlap shorter than the combined taxi
+    # (median ~16 min out + ~7 min in) never put two aircraft up together.
+    m["overlap_min"] = intersect(m.t_woff_in, m.t_won_in, m.t_woff_out, m.t_won_out)
+    m["overlap_gate_min"] = intersect(m.t_dep_in, m.t_arr_in, m.t_dep_out, m.t_arr_out)
     m["same_tail"] = m.Tail_Number_in == m.Tail_Number_out
     m["dup_callsign"] = (m.overlap_min > 0) & (~m.same_tail)
     m["dup_callsign_gate"] = (m.overlap_gate_min > 0) & (~m.same_tail)
-    # Near miss: inbound landed within 15 min of outbound rotating (would have overlapped
-    # with slightly more delay)
+    # Near miss: inbound landed within 15 min of the outbound rotating (would have
+    # overlapped with slightly more delay)
     m["near_miss"] = (m.overlap_min > -15) & (m.overlap_min <= 0) & (~m.same_tail)
+    # Reported actual clock times, for the CSV only.
+    m["ArrTime_in"] = m.ArrTime_in
+    m["DepTime_out"] = m.DepTime_out
     return m
+
+
+def validate(m):
+    """Invariants on the minute arithmetic. Bare integers carry no units, so the anchor
+    ("minutes from turn-airport local midnight") lives in a comment rather than a type;
+    these checks are what actually enforces it. Each one below corresponds to a bug this
+    script has shipped."""
+    problems = []
+
+    def check(name, bad):
+        n = int(bad.sum())
+        if n:
+            problems.append(f"  {name}: {n} rows")
+
+    air_in, air_out = m.AirTime_in, m.AirTime_out
+    # A leg cannot land before it rotates.
+    check("inbound airborne interval inverted", m.t_woff_in >= m.t_won_in)
+    check("outbound airborne interval inverted", m.t_woff_out >= m.t_won_out)
+    # Wheels times must sit inside the gate-to-gate window.
+    check("inbound wheels outside gate window",
+          (m.t_woff_in < m.t_dep_in) | (m.t_won_in > m.t_arr_in))
+    check("outbound wheels outside gate window",
+          (m.t_woff_out < m.t_dep_out) | (m.t_won_out > m.t_arr_out))
+    # Shared airborne time cannot exceed either leg's own air time. Both the -720 wrap bug
+    # and the subtract-instead-of-intersect bug violated this.
+    check("overlap exceeds inbound air time", m.overlap_min > air_in + 1e-6)
+    check("overlap exceeds outbound air time", m.overlap_min > air_out + 1e-6)
+    # A local-clock difference across two timezones masquerading as a duration shows up
+    # here: no domestic narrowbody leg runs 18h.
+    check("implausible inbound air time (>18h)", air_in > 1080)
+    check("negative scheduled buffer survived the turn filter", m.sched_buffer_min < 0)
+
+    if problems:
+        print("VALIDATION FAILURES:", file=sys.stderr)
+        for p in problems:
+            print(p, file=sys.stderr)
+    else:
+        print("validation: all timing invariants hold")
+    return not problems
 
 
 def main():
@@ -175,6 +224,7 @@ def main():
 
     df = load(args.data, args.carriers)
     m = build_pairs(df)
+    validate(m)
 
     m["callsign"] = m.Reporting_Airline_in.map(ICAO).fillna(m.Reporting_Airline_in) + m.Flight_Number_Reporting_Airline_in.astype(str)
 
