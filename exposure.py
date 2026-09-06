@@ -121,13 +121,23 @@ def build_pairs(df):
     # for both (inbound arrival local, outbound departure local), so no tz correction needed.
     m["sched_buffer_min"] = m.CRSDepTime_m_out - m.CRSArrTime_m_in
     # Actual overlap: inbound actual arrival later than outbound actual departure
-    # Gate-to-gate overlap: the outbound pushed back before the inbound reached its gate.
-    m["overlap_gate_min"] = m.ArrTime_m_in - m.DepTime_m_out
+    # Both overlaps are interval intersections, not simple differences. Subtracting
+    # (inbound arrival - outbound departure) silently assumes the inbound got airborne
+    # first. When the inbound is delayed *past* the outbound that is false: AAL1218 on
+    # 2025-11-28 was 1191 min late out of DCA and flew 0640-0934 the NEXT day, while the
+    # PHX outbound flew 1401-1937 the day before. The intervals are disjoint, but the
+    # difference reports ~20h of "simultaneous" flight -- longer than either leg was
+    # airborne, and enough to top the results.
+    gate_in = [m.DepTime_m_in, m.ArrTime_m_in]
+    gate_out = [m.DepTime_m_out, m.ArrTime_m_out]
+    m["overlap_gate_min"] = (pd.concat([gate_in[1], gate_out[1]], axis=1).min(axis=1)
+                             - pd.concat([gate_in[0], gate_out[0]], axis=1).max(axis=1))
     # Airborne overlap: both aircraft actually in the air at once under one callsign. This
     # is the headline number. A gate overlap shorter than the combined taxi times (median
     # ~16 min out + ~7 min in) never put two aircraft up together, so scoring on gate times
     # alone materially overcounts.
-    m["overlap_min"] = m.WheelsOn_m_in - m.WheelsOff_m_out
+    m["overlap_min"] = (pd.concat([m.WheelsOn_m_in, m.WheelsOn_m_out], axis=1).min(axis=1)
+                        - pd.concat([m.WheelsOff_m_in, m.WheelsOff_m_out], axis=1).max(axis=1))
     m["same_tail"] = m.Tail_Number_in == m.Tail_Number_out
     m["dup_callsign"] = (m.overlap_min > 0) & (~m.same_tail)
     m["dup_callsign_gate"] = (m.overlap_gate_min > 0) & (~m.same_tail)
