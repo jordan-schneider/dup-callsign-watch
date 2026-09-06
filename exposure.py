@@ -29,7 +29,7 @@ BTS_URL = ("https://transtats.bts.gov/PREZIP/"
 
 COLS = ["FlightDate", "Reporting_Airline", "Tail_Number", "Flight_Number_Reporting_Airline",
         "Origin", "Dest", "CRSDepTime", "DepTime", "CRSArrTime", "ArrTime",
-        "DepDelay", "ArrDelay", "Cancelled", "Diverted"]
+        "DepDelay", "ArrDelay", "TaxiOut", "TaxiIn", "Cancelled", "Diverted"]
 
 # ICAO carrier prefix so output reads as an ATC callsign
 ICAO = {"AA": "AAL", "OH": "JIA", "MQ": "ENY", "YX": "RPA", "PT": "PDT", "OO": "SKW",
@@ -64,7 +64,7 @@ def load(data_dir, carriers):
     if not frames:
         sys.exit(f"no BTS files found in {data_dir}")
     df = pd.concat(frames, ignore_index=True)
-    df = df[(df.Cancelled == 0)].copy()
+    df = df[(df.Cancelled == 0) & (df.Diverted == 0)].copy()
     df["FlightDate"] = pd.to_datetime(df.FlightDate)
     df["Flight_Number_Reporting_Airline"] = df.Flight_Number_Reporting_Airline.astype(int)
     return df
@@ -81,16 +81,24 @@ def build_pairs(df):
     df = df.copy()
     for c in ["CRSDepTime", "DepTime", "CRSArrTime", "ArrTime"]:
         df[c + "_m"] = hhmm_to_min(df[c])
-    # BTS keeps FlightDate = departure date; an arrival after midnight shows as e.g. 0013.
-    # If arrival minutes < departure minutes the flight crossed midnight: add a day.
-    for dep, arr in [("CRSDepTime_m", "CRSArrTime_m"), ("DepTime_m", "ArrTime_m")]:
-        wrap = df[arr] < df[dep]
-        df.loc[wrap, arr] += 1440
-    # Same for a departure that itself is after midnight relative to the schedule day
-    # (rare; e.g. sched 2350, actual 0020) so the outbound's actual dep isn't 24h early.
-    late = (df["DepTime_m"] - df["CRSDepTime_m"]) < -720
-    df.loc[late, "DepTime_m"] += 1440
-    df.loc[late, "ArrTime_m"] += 1440
+    # BTS keeps FlightDate = scheduled departure date. Only the *schedule* needs a
+    # midnight-wrap guess (a scheduled arrival earlier than its scheduled departure is a
+    # red-eye); schedules carry no delay, so that inference is safe.
+    wrap = df["CRSArrTime_m"] < df["CRSDepTime_m"]
+    df.loc[wrap, "CRSArrTime_m"] += 1440
+    # Actual times are rebuilt from the schedule plus the reported delay rather than read
+    # off the HHMM clock. DepDelay/ArrDelay are signed and unbounded, so this is exact for
+    # any wrap. Inferring the wrap from the clock breaks whenever a delay exceeds 12h: a
+    # leg scheduled 1452 that actually left 0630 the next day (DepDelay=938) reads as 8h
+    # *early*, and the resulting phantom overlap is large enough to top the results.
+    df["DepTime_m"] = df["CRSDepTime_m"] + pd.to_numeric(df["DepDelay"], errors="coerce")
+    df["ArrTime_m"] = df["CRSArrTime_m"] + pd.to_numeric(df["ArrDelay"], errors="coerce")
+    # BTS DepTime/ArrTime are *gate* times. Two aircraft only share a callsign in the air
+    # between the outbound's wheels-off and the inbound's wheels-on.
+    df["WheelsOff_m"] = df["DepTime_m"] + pd.to_numeric(df["TaxiOut"], errors="coerce")
+    df["WheelsOn_m"] = df["ArrTime_m"] - pd.to_numeric(df["TaxiIn"], errors="coerce")
+    df = df[df.DepTime_m.notna() & df.ArrTime_m.notna()
+            & df.WheelsOff_m.notna() & df.WheelsOn_m.notna()]
     key = ["FlightDate", "Reporting_Airline", "Flight_Number_Reporting_Airline"]
     a = df.add_suffix("_in")
     b = df.add_suffix("_out")
@@ -99,14 +107,32 @@ def build_pairs(df):
     m = m[(m.Origin_in == m.Dest_out) & (m.Dest_in == m.Origin_out)
           & (m.CRSDepTime_m_in < m.CRSDepTime_m_out)].copy()
     m["turn_airport"] = m.Dest_in
+    # A flight number may cover several legs a day (CLT-LEX-CLT-LEX); the self-join then
+    # pairs leg 1 with leg 4 as well as with leg 2. Keep the real turn: the reverse-
+    # direction leg scheduled to depart soonest after the inbound is scheduled to land.
+    m["_buf"] = m.CRSDepTime_m_out - m.CRSArrTime_m_in
+    m = (m[m._buf >= 0]
+         .sort_values("_buf")
+         .drop_duplicates(subset=["FlightDate_in", "Reporting_Airline_in",
+                                  "Flight_Number_Reporting_Airline_in",
+                                  "Origin_in", "Dest_in", "CRSDepTime_in"])
+         .drop(columns="_buf"))
     # Scheduled buffer: outbound sched dep minus inbound sched arr. Times are local at turn airport
     # for both (inbound arrival local, outbound departure local), so no tz correction needed.
     m["sched_buffer_min"] = m.CRSDepTime_m_out - m.CRSArrTime_m_in
     # Actual overlap: inbound actual arrival later than outbound actual departure
-    m["overlap_min"] = m.ArrTime_m_in - m.DepTime_m_out
+    # Gate-to-gate overlap: the outbound pushed back before the inbound reached its gate.
+    m["overlap_gate_min"] = m.ArrTime_m_in - m.DepTime_m_out
+    # Airborne overlap: both aircraft actually in the air at once under one callsign. This
+    # is the headline number. A gate overlap shorter than the combined taxi times (median
+    # ~16 min out + ~7 min in) never put two aircraft up together, so scoring on gate times
+    # alone materially overcounts.
+    m["overlap_min"] = m.WheelsOn_m_in - m.WheelsOff_m_out
     m["same_tail"] = m.Tail_Number_in == m.Tail_Number_out
     m["dup_callsign"] = (m.overlap_min > 0) & (~m.same_tail)
-    # Near miss: inbound landed within 15 min of outbound departure (would have overlapped with slightly more delay)
+    m["dup_callsign_gate"] = (m.overlap_gate_min > 0) & (~m.same_tail)
+    # Near miss: inbound landed within 15 min of outbound rotating (would have overlapped
+    # with slightly more delay)
     m["near_miss"] = (m.overlap_min > -15) & (m.overlap_min <= 0) & (~m.same_tail)
     return m
 
@@ -135,10 +161,11 @@ def main():
     events_out = events[["FlightDate_in", "callsign", "Reporting_Airline_in", "Flight_Number_Reporting_Airline_in",
                          "Origin_in", "turn_airport", "Tail_Number_in", "Tail_Number_out",
                          "CRSArrTime_in", "ArrTime_in", "CRSDepTime_out", "DepTime_out",
-                         "ArrDelay_in", "sched_buffer_min", "overlap_min"]]
+                         "ArrDelay_in", "sched_buffer_min", "overlap_gate_min", "overlap_min"]]
     events_out.columns = ["date", "callsign", "carrier", "flight", "origin", "turn_airport",
                           "tail_in", "tail_out", "sched_arr_in", "actual_arr_in", "sched_dep_out",
-                          "actual_dep_out", "inbound_arr_delay", "sched_buffer_min", "overlap_min"]
+                          "actual_dep_out", "inbound_arr_delay", "sched_buffer_min",
+                          "overlap_gate_min", "overlap_min"]
     events_out.to_csv(os.path.join(args.out, "exposure_events.csv"), index=False)
 
     g = m.groupby(["callsign", "Reporting_Airline_in", "Flight_Number_Reporting_Airline_in", "Origin_in", "turn_airport"])
@@ -156,7 +183,8 @@ def main():
     pairs.to_csv(os.path.join(args.out, "exposure_pairs.csv"), index=False)
 
     print(f"\n{len(df):,} flights -> {len(m):,} out-and-back pair-days across {len(pairs):,} distinct pairs")
-    print(f"{len(events):,} pair-days where two aircraft flew the same callsign simultaneously")
+    print(f"{len(events):,} pair-days where two aircraft were AIRBORNE under the same callsign at once")
+    print(f"{int(m.dup_callsign_gate.sum()):,} pair-days on the looser gate-time test (outbound pushed back before inbound arrived)")
     print(f"{int(m.near_miss.sum()):,} near misses (inbound landed <15 min before outbound departed, different tail)\n")
     print("Top exposed pairs:")
     with pd.option_context("display.width", 200, "display.max_columns", 20):
